@@ -1,0 +1,152 @@
+# React-router-v7
+Website
+/**
+ * Single-file Replit-ready app: chime tracker + contact form + SQLite storage + email sending
+ *
+ * Features:
+ * - GET /                : Home page with links
+ * - GET /about           : Shows parsed public metadata for the Chime landing page
+ * - GET /email           : Contact form UI
+ * - POST /api/email/submit : Accepts JSON or form submission, validates, rate-limits, saves to SQLite, sends email (SendGrid or SMTP or logs)
+ * - GET /admin/submissions : Admin UI to view stored submissions (protected by ADMIN_TOKEN via ?admin_token=... or Authorization: Bearer ...)
+ * - GET /api/referrals/latest : JSON endpoint returning parsed landing page metadata (optional ?url=... restricted to chime.com)
+ *
+ * Usage on Replit:
+ * 1) Add Secrets / Environment variables in Replit:
+ *    - ADMIN_TOKEN (required to view admin page)
+ *    - CONTACT_EMAIL (default recipient, e.g. jamesrobinett@aol.com)
+ *    - SENDER_EMAIL (optional; default no-reply@localhost)
+ *    - SENDGRID_API_KEY (optional; if present, SendGrid used)
+ *    - SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS (optional fallback)
+ *    - DATABASE_PATH (optional; default "./data/submissions.sqlite")
+ *
+ * 2) Install deps:
+ *    npm install express better-sqlite3 nodemailer
+ *
+ * 3) Run:
+ *    node server.js
+ *
+ * Notes:
+ * - This is a simple, single-file demo suitable for small projects or local/Replit use.
+ * - For production, replace in-memory rate limiter with a durable solution, use HTTPS, protect admin with real auth, and use a hosted DB/email provider.
+ */
+
+import express from "express";
+import fs from "node:fs";
+import path from "node:path";
+import Database from "better-sqlite3";
+import nodemailer from "nodemailer";
+import process from "node:process";
+import fetch from "node-fetch"; // If Node 18+ you can remove this import and use global fetch
+
+// --------- Configuration from environment ----------
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const CONTACT_EMAIL = process.env.CONTACT_EMAIL ?? "jamesrobinett@aol.com";
+const SENDER_EMAIL = process.env.SENDER_EMAIL ?? `no-reply@${process.env.APP_DOMAIN ?? "localhost"}`;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "change_this_to_a_real_token";
+const DATABASE_PATH = process.env.DATABASE_PATH ?? path.resolve(process.cwd(), "data", "submissions.sqlite");
+
+// Email config envs:
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY ?? "";
+const SMTP_HOST = process.env.SMTP_HOST ?? "";
+const SMTP_PORT = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : undefined;
+const SMTP_USER = process.env.SMTP_USER ?? "";
+const SMTP_PASS = process.env.SMTP_PASS ?? "";
+
+// --------- Setup DB (better-sqlite3) ----------
+function ensureDb() {
+  const dir = path.dirname(DATABASE_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  const db = new Database(DATABASE_PATH);
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS submissions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT,
+      email TEXT NOT NULL,
+      phone TEXT,
+      message TEXT NOT NULL,
+      ip TEXT,
+      created_at TEXT NOT NULL
+    );`
+  );
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_submissions_created_at ON submissions(created_at);`);
+  return db;
+}
+const db = ensureDb();
+
+function saveSubmission({ name, email, phone, message, ip }) {
+  const stmt = db.prepare(
+    `INSERT INTO submissions (name, email, phone, message, ip, created_at)
+     VALUES (@name, @email, @phone, @message, @ip, @created_at)`
+  );
+  const created_at = new Date().toISOString();
+  const info = stmt.run({ name: name ?? null, email, phone: phone ?? null, message, ip: ip ?? null, created_at });
+  return {
+    id: Number(info.lastInsertRowid),
+    name: name ?? null,
+    email,
+    phone: phone ?? null,
+    message,
+    ip: ip ?? null,
+    created_at,
+  };
+}
+
+function getAllSubmissions() {
+  const stmt = db.prepare(`SELECT id, name, email, phone, message, ip, created_at FROM submissions ORDER BY created_at DESC`);
+  return stmt.all();
+}
+
+// --------- Rate limiter (in-memory simple) ----------
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_MAX = 10; // max submits per IP in window
+const rateMap = new Map();
+function recordAndCheckRate(ip) {
+  const now = Date.now();
+  const arr = rateMap.get(ip) ?? [];
+  const pruned = arr.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  pruned.push(now);
+  rateMap.set(ip, pruned);
+  return pruned.length <= RATE_LIMIT_MAX;
+}
+
+// --------- Utility helpers ----------
+function escapeHtml(s = "") {
+  return s
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+function getIpFromReq(req) {
+  return (req.headers["x-forwarded-for"] || req.ip || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+}
+
+// --------- Mailer: SendGrid -> SMTP -> console ----------
+async function sendContactEmail({ name, email, phone, message, ip }) {
+  const subject = `Contact form submission from ${name || email || "anonymous"}`;
+  const text = [
+    `Name: ${name || "—"}`,
+    `Email: ${email || "—"}`,
+    `Phone: ${phone || "—"}`,
+    `IP: ${ip || "—"}`,
+    "",
+    "Message:",
+    message || "—",
+  ].join("\n");
+
+  const html = `<p><strong>Name:</strong> ${escapeHtml(name || "—")}</p>
+  <p><strong>Email:</strong> ${escapeHtml(email || "—")}</p>
+  <p><strong>Phone:</strong> ${escapeHtml(phone || "—")}</p>
+  <p><strong>IP:</strong> ${escapeHtml(ip || "—")}</p>
+  <hr/>
+  <div>${escapeHtml(message || "—").replace(/\n/g, "<br/>")}</div>`;
+
+  // 1) SendGrid
+  if (SENDGRID_API_KEY) {
+    try {
+      const payload = {
+        personalizations: [{ to: [{ email: CONTACT_EMAIL }], subject }],
+        from: { email: S
